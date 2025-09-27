@@ -353,7 +353,28 @@ jobs:
             tail -50 out/config.log
             exit 1
           fi
-          
+      - name: Add missing driver configurations
+        run: |
+         set -e
+          cd kernel_workspace/kernel_platform
+    
+          CONFIG_FILE="./arch/arm64/configs/gki_defconfig"
+    # 添加缺失的驱动配置
+          echo "CONFIG_QCOM_SMEM=y" >> "$CONFIG_FILE"
+          echo "CONFIG_QCOM_SMEM_STATE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_QCOM_GLINK=y" >> "$CONFIG_FILE"
+          echo "CONFIG_QCOM_GLINK_SMEM=y" >> "$CONFIG_FILE"
+    
+    # OPlus 相关配置
+          echo "CONFIG_OPLUS_SYSTEM_KERNEL=y" >> "$CONFIG_FILE"
+          echo "CONFIG_OPLUS_ARCH_FILE=y" >> "$CONFIG_FILE"
+          echo "CONFIG_OPLUS_DEVICE_IFNO=y" >> "$CONFIG_FILE"
+    
+    # 传感器相关
+          echo "CONFIG_SENSORS=y" >> "$CONFIG_FILE"
+          echo "CONFIG_SENSORS_OPLUS_SENSOR_DEVINFO=y" >> "$CONFIG_FILE"
+    
+          echo "✅ 添加了缺失的驱动配置"
           # 步骤4: 构建内核
           echo "步骤4: 开始内核编译..."
           start_time=$(date +%s)
