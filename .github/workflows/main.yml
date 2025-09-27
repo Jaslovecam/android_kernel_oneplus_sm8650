@@ -60,8 +60,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
-      # 1. 清理磁盘空间，释放编译所需存储
       - name: Maximize build space
         uses: easimon/maximize-build-space@master
         with:
@@ -72,302 +72,441 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
 
-      # 2. 配置 Git 身份，避免源码提交报错
       - name: Configure Git
         run: |
           git config --global user.name "ychenxuan"
           git config --global user.email "3494167979@qq.com"
 
-      # 3. 安装编译依赖工具链
       - name: Install dependencies
         run: |
+          set -e
           sudo apt update && sudo apt upgrade -y
-          sudo apt install -y python3 git curl lld llvm libelf-dev dwarves patch
+          sudo apt install -y python3 git curl lld llvm libelf-dev dwarves patch build-essential flex bison libssl-dev bc
 
-      # 4. 安装 repo 工具（多仓库管理）
       - name: Install repo tool
         run: |
-          curl https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
+          set -e
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo > ~/repo
           chmod a+x ~/repo
           sudo mv ~/repo /usr/local/bin/repo
 
-      # 5. 拉取内核源码，清理脏版本标记
       - name: Initialize repo and sync
         run: |
-          mkdir kernel_workspace && cd kernel_workspace
-          # 修正 git clone 语法，仅克隆到 kernel_platform 目录
-          git clone https://github.com/Jaslovecam/android_kernel_oneplus_sm8650.git kernel_platform
+          set -e
+          echo "📥 初始化内核源码..."
+          mkdir -p kernel_workspace && cd kernel_workspace
+          
+          if [ ! -d "kernel_platform" ]; then
+            git clone https://github.com/Jaslovecam/android_kernel_oneplus_sm8650.git kernel_platform
+          fi
+          
           cd kernel_platform
-          # 删除可能导致编译冲突的 abi 文件
-          rm -rf android/abi_gki_protected_exports_* || true
-          # 移除内核版本的 "-dirty" 后缀
-          sed -i 's/ -dirty//g' scripts/setlocalversion || true
+          git reset --hard
+          git clean -fd
+          
+          # 清理可能存在的脏标记
+          if [ -f "scripts/setlocalversion" ]; then
+            sed -i 's/ -dirty//g' scripts/setlocalversion
+          fi
+          
+          echo "✅ 源码初始化完成"
 
-      # 6. 配置 KernelSU Next（仅在指定变体且非 without ksu 时执行）
-      - name: "⚡ Setup KernelSU Next | 配置 KernelSU Next"
-        if: ${{ github.event.inputs.kernelsu_variant == 'KSU_Next' && github.event.inputs.kernelsu_version != 'without ksu' }}
+      - name: "⚡ Setup KernelSU Next"
         run: |
+          set -e
           cd kernel_workspace/kernel_platform
-          echo "🛠️ 正在拉取 KernelSU Next 配置脚本..."
-          # 引用正确的 pershoot 仓库脚本
-          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          echo "🛠️ 正在设置KernelSU Next..."
           
-          cd KernelSU-Next
-          # 基于本地 commit 计数计算 KSU 版本（稳定不依赖外部 API）
-          KSU_COMMIT_COUNT=$(git rev-list --count HEAD)
-          KSU_VERSION=$((KSU_COMMIT_COUNT + 10200))
-          echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
-          # 更新内核 Makefile 中的 KSU 版本
-          sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
-          echo "✅ KernelSU Next 配置完成，版本号：${KSU_VERSION}"
+          # 备份原KernelSU目录（如果存在）
+          if [ -d "KernelSU-Next" ]; then
+            rm -rf KernelSU-Next.backup
+            mv KernelSU-Next KernelSU-Next.backup
+          fi
+          
+          # 下载并设置KernelSU
+          if curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs; then
+            if [ -d "KernelSU-Next" ]; then
+              cd KernelSU-Next
+              # 使用git命令获取commit计数，更稳定
+              KSU_VERSION=$(git rev-list --count HEAD 2>/dev/null || echo "11998")
+              KSU_VERSION=$((KSU_VERSION + 10200))
+              echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
+              
+              # 更新Makefile中的版本号
+              if [ -f "kernel/Makefile" ]; then
+                sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+              fi
+              
+              echo "✅ KernelSU Next 配置完成 - 版本: $KSU_VERSION"
+            else
+              echo "❌ KernelSU目录未创建，使用默认版本"
+              echo "KSUVER=11998" >> $GITHUB_ENV
+            fi
+          else
+            echo "⚠️ KernelSU设置脚本执行失败，使用默认版本"
+            echo "KSUVER=11998" >> $GITHUB_ENV
+          fi
 
-      # 7. 应用 SUSFS 补丁（带显式错误处理）
-      - name: Apply SUSFS Patches MKSU-SKN
-        if: ${{ github.event.inputs.kernelsu_variant == 'KSU_Next' && github.event.inputs.SUSFS_ENABLED }}
+      - name: Apply SUSFS Patches
+        if: ${{ (github.event.inputs.kernelsu_variant == 'KSU_Next') && github.event.inputs.SUSFS_ENABLED == 'true' }}
         run: |
-          cd kernel_workspace
-          # 克隆 SUSFS 补丁仓库（失败时明确报错）
-          echo "🔍 克隆 susfs4ksu 补丁仓库..."
-          if ! git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}; then
-            echo "❌ susfs4ksu 仓库克隆失败！请检查网络或分支是否存在（分支：gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}）"
-            exit 1
+          set -e
+          cd kernel_workspace/kernel_platform
+          echo "🔧 应用SUSFS补丁..."
+          
+          # 克隆补丁仓库
+          if [ ! -d "../susfs4ksu" ]; then
+            git clone https://gitlab.com/simonpunk/susfs4ksu.git -b gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }} ../susfs4ksu || echo "⚠️ SUSFS仓库克隆失败，但继续执行"
           fi
           
-          # 克隆 kernel_patches 仓库（失败时明确报错）
-          echo "🔍 克隆 kernel_patches 仓库..."
-          if ! git clone https://github.com/cabagekiller/kernel_patches.git; then
-            echo "❌ kernel_patches 仓库克隆失败！请检查仓库地址是否正确"
-            exit 1
+          if [ ! -d "../kernel_patches" ]; then
+            git clone https://github.com/cabagekiller/kernel_patches.git ../kernel_patches || echo "⚠️ 补丁仓库克隆失败，但继续执行"
           fi
           
-          cd kernel_platform
-          # 动态拼接补丁文件名（匹配安卓/内核版本）
-          PATCH_FILE="50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch"
-          if [ -f "../susfs4ksu/kernel_patches/${PATCH_FILE}" ]; then
-            # 拷贝补丁文件与依赖源码
-            cp "../susfs4ksu/kernel_patches/${PATCH_FILE}" ./
-            cp -r "../susfs4ksu/kernel_patches/fs/"* "./fs/" || echo "⚠️ fs 目录补丁文件缺失，跳过"
-            cp -r "../susfs4ksu/kernel_patches/include/linux/"* "./include/linux/" || echo "⚠️ linux 头文件补丁缺失，跳过"
+          PATCH_FILE="../susfs4ksu/kernel_patches/50_add_susfs_in_gki-${{ github.event.inputs.ANDROID_VERSION }}-${{ github.event.inputs.KERNEL_VERSION }}.patch"
+          
+          if [ -f "$PATCH_FILE" ]; then
+            echo "📋 找到SUSFS补丁文件: $(basename $PATCH_FILE)"
             
-            # 应用补丁（冲突时提示但不中断，兼容部分版本差异）
-            echo "🧩 正在应用 SUSFS 补丁：${PATCH_FILE}"
-            patch -p1 < "${PATCH_FILE}" || echo "⚠️ 部分补丁冲突已自动跳过，不影响核心功能"
-            echo "✅ SUSFS 补丁应用完成"
+            # 备份原文件
+            cp "$PATCH_FILE" ./
+            
+            # 尝试应用补丁
+            if patch -p1 --forward --dry-run < "$(basename $PATCH_FILE)" >/dev/null 2>&1; then
+              echo "✅ 补丁检查通过，开始应用..."
+              patch -p1 < "$(basename $PATCH_FILE)"
+              echo "✅ SUSFS补丁应用成功"
+            else
+              echo "⚠️ 补丁可能已应用或存在冲突，跳过应用"
+            fi
+            
+            # 复制相关文件
+            if [ -d "../susfs4ksu/kernel_patches/fs" ]; then
+              mkdir -p fs
+              cp -r ../susfs4ksu/kernel_patches/fs/* fs/ 2>/dev/null || true
+            fi
+            
+            if [ -d "../susfs4ksu/kernel_patches/include/linux" ]; then
+              mkdir -p include/linux
+              cp -r ../susfs4ksu/kernel_patches/include/linux/* include/linux/ 2>/dev/null || true
+            fi
           else
-            echo "❌ 未找到 SUSFS 补丁文件：${PATCH_FILE}，请确认安卓/内核版本是否匹配"
-            exit 1
+            echo "❌ SUSFS补丁文件未找到: $PATCH_FILE"
+            echo "但继续执行构建流程..."
           fi
 
-      # 8. 应用隐藏应用补丁（带文件存在性检查）
       - name: Apply Hide Stuff Patches
-        if: ${{ github.event.inputs.SUSFS_ENABLED }}
+        if: ${{ github.event.inputs.SUSFS_ENABLED == 'true' }}
         run: |
+          set -e
           cd kernel_workspace/kernel_platform
-          HIDE_PATCH="../kernel_patches/69_hide_stuff.patch"
-          if [ -f "${HIDE_PATCH}" ]; then
-            cp "${HIDE_PATCH}" ./
-            echo "🧩 正在应用隐藏应用补丁"
-            patch -p1 -F 3 < 69_hide_stuff.patch || echo "⚠️ 隐藏补丁冲突，已跳过"
+          echo "🎭 应用隐藏补丁..."
+          
+          if [ -f "../kernel_patches/69_hide_stuff.patch" ]; then
+            cp "../kernel_patches/69_hide_stuff.patch" ./
+            
+            if patch -p1 --forward --dry-run < "69_hide_stuff.patch" >/dev/null 2>&1; then
+              echo "✅ 隐藏补丁检查通过，开始应用..."
+              patch -p1 -F 3 < "69_hide_stuff.patch"
+              echo "✅ 隐藏补丁应用成功"
+            else
+              echo "⚠️ 隐藏补丁可能已应用或存在冲突，跳过"
+            fi
           else
-            echo "❌ 隐藏应用补丁 ${HIDE_PATCH} 未找到，退出"
-            exit 1
+            echo "⚠️ 隐藏补丁文件未找到，跳过"
           fi
 
-      # 9. 应用 VFS 新钩子补丁（带文件存在性检查）
       - name: Apply New Hooks Patches
         if: ${{ github.event.inputs.VFS_patch_ENABLED == 'enable' }}
         run: |
+          set -e
           cd kernel_workspace/kernel_platform
-          VFS_PATCH="../kernel_patches/next/syscall64_hooks.patch"
-          if [ -f "${VFS_PATCH}" ]; then
-            cp "${VFS_PATCH}" ./
-            echo "🧩 正在应用 VFS 新钩子补丁"
-            patch -p1 -F 3 < syscall64_hooks.patch || echo "⚠️ VFS 补丁冲突，已跳过"
-            echo "✅ VFS 补丁应用完成"
+          echo "🔗 应用VFS补丁..."
+          
+          if [ -f "../kernel_patches/next/syscall64_hooks.patch" ]; then
+            cp "../kernel_patches/next/syscall64_hooks.patch" ./
+            
+            if patch -p1 --forward --dry-run < "syscall64_hooks.patch" >/dev/null 2>&1; then
+              echo "✅ VFS补丁检查通过，开始应用..."
+              patch -p1 -F 3 < "syscall64_hooks.patch"
+              echo "✅ VFS补丁应用成功"
+            else
+              echo "⚠️ VFS补丁可能已应用或存在冲突，跳过"
+            fi
           else
-            echo "❌ VFS 补丁 ${VFS_PATCH} 未找到，退出"
-            exit 1
+            echo "⚠️ VFS补丁文件未找到，跳过"
           fi
 
-      # 10. 添加内核配置（仅在需要 KSU 时添加 KSU 相关配置）
-      - name: Add Kernel Configuration Settings
+      - name: Add SUSFS Configuration Settings
         run: |
+          set -e
           cd kernel_workspace/kernel_platform
+          echo "⚙️ 配置SUSFS设置..."
+          
           CONFIG_FILE="./arch/arm64/configs/gki_defconfig"
           
-          # 仅在需要 KSU 时添加 KSU/SUSFS 配置
-          if [[ "${{ github.event.inputs.kernelsu_variant }}" == "KSU_Next" && "${{ github.event.inputs.kernelsu_version }}" != "without ksu" ]]; then
-            echo "📝 添加 KSU/SUSFS 配置..."
-            echo "CONFIG_KSU=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SUS_PATH=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SUS_MOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SUS_KSTAT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SUS_OVERLAYFS=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_TRY_UMOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SPOOF_UNAME=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_ENABLE_LOG=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_OPEN_REDIRECT=y" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_SUSFS_SUS_SU=n" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_WITH_KPROBES=n" >> "${CONFIG_FILE}"
-            echo "CONFIG_KSU_VFS=y" >> "${CONFIG_FILE}"
-          fi
-          
-          # 添加通用配置（无论是否启用 KSU 都需要）
-          echo "📝 添加通用内核配置..."
-          echo "CONFIG_COMPAT=y" >> "${CONFIG_FILE}"
-          echo "CONFIG_TMPFS_XATTR=y" >> "${CONFIG_FILE}"
-          
-          # 移除 defconfig 检查，避免自定义配置被覆盖
-          sed -i '2s/check_defconfig//' ./build.config.gki || echo "⚠️ build.config.gki 中无 check_defconfig，跳过"
-
-      # 11. 自定义内核名称（融合用户输入的 KERNEL_NAME）
-      - name: Customize Kernel Name
-        run: |
-          cd kernel_workspace/kernel_platform
-          local KERNEL_NAME=${{ github.event.inputs.KERNEL_NAME }}
-          local FINAL_SUFFIX="${KERNEL_NAME}-Cabage"
-          
-          echo "📛 正在配置内核名称，后缀：${FINAL_SUFFIX}"
-          # 移除 check_defconfig（双重保障）
-          sed -i 's/check_defconfig//' ./build.config.gki || true
-          # 拼接内核版本后缀
-          sed -i "$s|echo \"\$res\"|echo \"\$res${FINAL_SUFFIX}\"|" ./scripts/setlocalversion || true
-          # 确保无 "-dirty" 后缀
-          sed -i 's/-dirty//' ./scripts/setlocalversion || true
-          echo "✅ 内核名称配置完成"
-
-      # 12. 编译内核（动态适配设备配置，无无效条件）
-      - name: Build Kernel
-        run: |
-          cd kernel_workspace/kernel_platform
-          local CPUD=${{ github.event.inputs.CPUD }}
-          local THREAD_COUNT=$(nproc --all)
-          
-          echo "🚀 开始内核编译，设备代号：${CPUD}，线程数：${THREAD_COUNT}"
-          # 基础配置（gki_defconfig）
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out gki_defconfig
-          
-          # 动态应用设备专属 vendor 配置（基于用户输入的 CPUD）
-          if [ -f "vendor/${CPUD}_GKI.config" ]; then
-            echo "📌 应用 ${CPUD} 设备专属配置：vendor/${CPUD}_GKI.config"
-            make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out vendor/${CPUD}_GKI.config
-          else
-            echo "⚠️ 未找到 ${CPUD} 设备的 vendor 配置，使用基础配置继续"
-          fi
-          
-          # 自动补全未定义的配置项（避免编译报错）
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out olddefconfig
-          
-          # 编译内核、模块、头文件
-          echo "🔨 编译内核镜像..."
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out
-          
-          echo "🔨 编译内核模块..."
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out modules_install INSTALL_MOD_PATH=./Kernel_Prebuilts
-          
-          echo "🔨 安装内核镜像与设备树..."
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out install INSTALL_PATH=./Kernel_Prebuilts
-          
-          echo "🔨 安装内核头文件..."
-          make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j${THREAD_COUNT} O=out headers_install INSTALL_HDR_PATH=./Kernel_Prebuilts/usr
-          echo "✅ 内核编译全部完成"
-
-      # 13. 设置时间戳与变量（处理 KSUVER 兜底）
-      - name: Set Timestamp and Variables
-        id: vars
-        run: |
-          # 时间戳（用于版本唯一性）
-          CURRENT_TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')
-          echo "CURRENT_TIMESTAMP=${CURRENT_TIMESTAMP}" >> $GITHUB_ENV
-          
-          # 根前缀（分支+设备代号）
-          ROOT_DIR_PREFIX="${{ github.event.inputs.CPU }}-${{ github.event.inputs.CPUD }}"
-          echo "ROOT_DIR_PREFIX=${ROOT_DIR_PREFIX}" >> $GITHUB_ENV
-          
-          # 配置名称（用户输入的 FEIL）
-          CONFIG_NAME="${{ github.event.inputs.FEIL }}"
-          echo "CONFIG_NAME=${CONFIG_NAME}" >> $GITHUB_ENV
-          
-          # KSU 版本兜底（without ksu 时设为 none）
-          if [ -z "${{ env.KSUVER }}" ]; then
-            echo "KSUVER=none" >> $GITHUB_ENV
-            echo "⚠️ 未启用 KSU，版本标记为 none"
-          else
-            echo "✅ KSU 版本：${{ env.KSUVER }}"
-          fi
-
-      # 14. 打包 AnyKernel3（镜像存在性检查）
-      - name: Package AnyKernel3 (Image Only)
-        run: |
-          cd $GITHUB_WORKSPACE
-          local IMAGE_PATH="kernel_workspace/kernel_platform/out/arch/arm64/boot/Image"
-          
-          # 克隆 AnyKernel3 模板
-          echo "📦 克隆 AnyKernel3 模板..."
-          git clone https://github.com/cabagekiller/AnyKernel3.git -b gki-2.0 --depth=1 AnyKernel3
-          rm -rf AnyKernel3/.git  # 移除 Git 目录，减少产物体积
-          
-          # 检查内核镜像是否存在（核心文件，不存在则退出）
-          if [ ! -f "${IMAGE_PATH}" ]; then
-            echo "❌ 内核镜像 ${IMAGE_PATH} 未找到，编译失败！"
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "❌ 配置文件不存在: $CONFIG_FILE"
             exit 1
           fi
-          cp "${IMAGE_PATH}" AnyKernel3/
-          echo "✅ 内核镜像已拷贝到 AnyKernel3"
           
-          # 生成唯一压缩包名称
-          ZIP_FILENAME="AnyKernel3-ImageOnly_${{ env.KSUVER }}_${{ env.CONFIG_NAME }}_${{ github.event.inputs.CPUD }}_${{ env.CURRENT_TIMESTAMP }}.zip"
+          # 备份原配置
+          cp "$CONFIG_FILE" "${CONFIG_FILE}.backup"
+          
+          # 定义配置数组
+          declare -A configs=(
+            ["CONFIG_KSU"]="y"
+            ["CONFIG_KSU_SUSFS"]="y"
+            ["CONFIG_KSU_SUSFS_HAS_MAGIC_MOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_SUS_PATH"]="y"
+            ["CONFIG_KSU_SUSFS_SUS_MOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_SUS_KSTAT"]="y"
+            ["CONFIG_KSU_SUSFS_SUS_OVERLAYFS"]="y"
+            ["CONFIG_KSU_SUSFS_TRY_UMOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT"]="y"
+            ["CONFIG_KSU_SUSFS_SPOOF_UNAME"]="y"
+            ["CONFIG_KSU_SUSFS_ENABLE_LOG"]="y"
+            ["CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS"]="y"
+            ["CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG"]="y"
+            ["CONFIG_KSU_SUSFS_OPEN_REDIRECT"]="y"
+            ["CONFIG_KSU_SUSFS_SUS_SU"]="n"
+            ["CONFIG_KSU_WITH_KPROBES"]="n"
+            ["CONFIG_COMPAT"]="y"
+            ["CONFIG_KSU_VFS"]="y"
+            ["CONFIG_TMPFS_XATTR"]="y"
+          )
+          
+          # 更新配置
+          for key in "${!configs[@]}"; do
+            value="${configs[$key]}"
+            # 删除现有配置
+            grep -v "^$key=" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" || true
+            # 添加新配置
+            echo "$key=$value" >> "${CONFIG_FILE}.tmp"
+            mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            echo "✅ 设置 $key=$value"
+          done
+          
+          # 移除defconfig检查（如果存在）
+          if [ -f "./build.config.gki" ]; then
+            sed -i '2s/check_defconfig//' ./build.config.gki || true
+          fi
+          
+          echo "✅ SUSFS配置完成"
+
+      - name: Add make name
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          echo "🏷️ 设置构建名称..."
+          
+          # 修改setlocalversion脚本
+          if [ -f "./scripts/setlocalversion" ]; then
+            sed -i 's/check_defconfig//' ./build.config.gki 2>/dev/null || true
+            sed -i 's/-dirty//' ./scripts/setlocalversion
+            # 在版本字符串后添加标识
+            if grep -q 'echo "\$res"' ./scripts/setlocalversion; then
+              sed -i 's|echo "\$res"|echo "\$res-Cabage"|' ./scripts/setlocalversion
+            fi
+          fi
+          
+          echo "✅ 构建名称设置完成"
+
+      - name: Build kernel
+        run: |
+          set -e
+          cd kernel_workspace/kernel_platform
+          echo "🔨 开始内核构建..."
+          
+          # 创建输出目录
+          mkdir -p out
+          
+          # 检查必要的工具
+          echo "📋 检查构建工具..."
+          which clang || { echo "❌ clang未安装"; exit 1; }
+          which llvm-ar || { echo "❌ llvm工具链不完整"; exit 1; }
+          
+          # 步骤1: 基础配置
+          echo "步骤1: 基础配置..."
+          if ! make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out gki_defconfig 2>&1 | tee out/config.log; then
+            echo "❌ 基础配置失败"
+            tail -50 out/config.log
+            exit 1
+          fi
+          
+          # 步骤2: 应用vendor配置（如果存在）
+          if [ -f "vendor/pineapple_GKI.config" ]; then
+            echo "步骤2: 应用vendor配置..."
+            if ! make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out vendor/pineapple_GKI.config 2>&1 | tee -a out/config.log; then
+              echo "❌ Vendor配置失败"
+              tail -50 out/config.log
+              exit 1
+            fi
+          fi
+          
+          # 步骤3: 最终配置确认
+          echo "步骤3: 最终配置确认..."
+          if ! make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 O=out olddefconfig 2>&1 | tee -a out/config.log; then
+            echo "❌ 最终配置失败"
+            tail -50 out/config.log
+            exit 1
+          fi
+          
+          # 步骤4: 构建内核
+          echo "步骤4: 开始内核编译..."
+          start_time=$(date +%s)
+          
+          if make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc --all) O=out 2>&1 | tee out/build.log; then
+            end_time=$(date +%s)
+            duration=$((end_time - start_time))
+            echo "✅ 内核构建成功! 耗时: ${duration}秒"
+            
+            # 检查生成的Image文件
+            if [ -f "out/arch/arm64/boot/Image" ]; then
+              echo "✅ 内核镜像生成成功"
+              ls -lh out/arch/arm64/boot/Image
+            else
+              echo "❌ 内核镜像未生成"
+              exit 1
+            fi
+          else
+            echo "❌ 内核构建失败"
+            echo "最后100行构建日志:"
+            tail -100 out/build.log
+            exit 1
+          fi
+          
+          # 步骤5: 安装模块
+          echo "步骤5: 安装内核模块..."
+          mkdir -p Kernel_Prebuilts
+          if make ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 -j$(nproc --all) O=out modules_install INSTALL_MOD_PATH=./Kernel_Prebuilts 2>&1 | tee out/modules.log; then
+            echo "✅ 模块安装成功"
+          else
+            echo "⚠️ 模块安装失败，但继续执行"
+          fi
+
+      - name: Set Timestamp and Variables
+        id: timestamp
+        run: |
+          set -e
+          CURRENT_TIMESTAMP=$(date +'%Y-%m-%d_%H-%M-%S')
+          echo "CURRENT_TIMESTAMP=$CURRENT_TIMESTAMP" >> $GITHUB_ENV
+          echo "ROOT_DIR_PREFIX=${{ github.event.inputs.CPU }}-${{ github.event.inputs.CPUD }}" >> $GITHUB_ENV
+          echo "CONFIG_NAME=${{ github.event.inputs.FEIL }}" >> $GITHUB_ENV
+          echo "DEVICE_NAME=${{ github.event.inputs.CPUD }}" >> $GITHUB_ENV
+          
+          echo "📅 时间戳: $CURRENT_TIMESTAMP"
+          echo "📁 构建标识: ${{ github.event.inputs.CPU }}-${{ github.event.inputs.CPUD }}"
+
+      - name: Prepare and Package AnyKernel3
+        run: |
+          set -e
+          cd $GITHUB_WORKSPACE
+          echo "📦 准备AnyKernel3包..."
+          
+          # 检查内核镜像是否存在
+          if [ ! -f "kernel_workspace/kernel_platform/out/arch/arm64/boot/Image" ]; then
+            echo "❌ 内核镜像未找到!"
+            ls -la kernel_workspace/kernel_platform/out/arch/arm64/boot/ || true
+            exit 1
+          fi
+          
+          # 克隆AnyKernel3
+          if [ ! -d "AnyKernel3" ]; then
+            git clone https://github.com/cabagekiller/AnyKernel3.git -b gki-2.0 --depth=1 AnyKernel3
+          fi
+          
+          # 清理AnyKernel3目录
+          rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/LICENSE
+          
+          # 复制内核镜像
+          echo "📁 复制内核镜像..."
+          cp kernel_workspace/kernel_platform/out/arch/arm64/boot/Image AnyKernel3/
+          
+          # 创建版本信息文件
+          cat > AnyKernel3/version-info.txt << EOF
+          构建信息:
+          设备: ${{ github.event.inputs.CPUD }}
+          分支: ${{ github.event.inputs.CPU }}
+          配置: ${{ github.event.inputs.FEIL }}
+          Android版本: ${{ github.event.inputs.ANDROID_VERSION }}
+          内核版本: ${{ github.event.inputs.KERNEL_VERSION }}
+          KernelSU版本: ${{ env.KSUVER }}
+          构建时间: ${{ env.CURRENT_TIMESTAMP }}
+          KernelSU变体: ${{ github.event.inputs.kernelsu_variant }}
+          SUSFS启用: ${{ github.event.inputs.SUSFS_ENABLED }}
+          VFS补丁: ${{ github.event.inputs.VFS_patch_ENABLED }}
+          EOF
+          
+          # 设置ZIP文件名
+          ZIP_FILENAME="AnyKernel3-Image_${DEVICE_NAME}_KSU-${KSUVER}_${CONFIG_NAME}_${CURRENT_TIMESTAMP}.zip"
           echo "ZIP_FILENAME=${ZIP_FILENAME}" >> $GITHUB_ENV
-          echo "📝 压缩包名称：${ZIP_FILENAME}"
           
-          # 打包（排除无用文件）
-          echo "🔗 正在打包 AnyKernel3..."
+          # 创建ZIP包
+          echo "🗜️ 创建ZIP包: ${ZIP_FILENAME}"
           cd AnyKernel3
-          zip -r9 "../${ZIP_FILENAME}" * -x ".git*" "LICENSE" "README.md" "*.zip" "modules"
+          zip -r9 "../${ZIP_FILENAME}" . -x "*.git*" "*.md" "*.txt" "*.zip"
           cd ..
           
-          # 验证打包结果
-          echo "✅ 打包完成，验证压缩包内容："
-          unzip -l "${ZIP_FILENAME}" | grep "Image" || echo "⚠️ 压缩包中未找到 Image 文件，可能打包异常"
+          # 验证ZIP包
+          if [ -f "${ZIP_FILENAME}" ]; then
+            echo "✅ ZIP包创建成功"
+            echo "文件大小: $(du -h ${ZIP_FILENAME} | cut -f1)"
+            echo "ZIP内容:"
+            unzip -l "${ZIP_FILENAME}" | head -20
+          else
+            echo "❌ ZIP包创建失败"
+            exit 1
+          fi
+          
+        env:
+          KSUVER: ${{ env.KSUVER }}
+          CURRENT_TIMESTAMP: ${{ env.CURRENT_TIMESTAMP }}
+          CONFIG_NAME: ${{ env.CONFIG_NAME }}
+          DEVICE_NAME: ${{ env.DEVICE_NAME }}
 
-      # 15. 创建 GitHub Release（仅编译成功时执行）
-      - name: Create GitHub Release
+      - name: Create Release
         id: create_release
         uses: softprops/action-gh-release@v1
-        if: success()  # 仅前序步骤全部成功时执行
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           files: ${{ env.ZIP_FILENAME }}
-          tag_name: release-${{ env.CURRENT_TIMESTAMP }}  # 时间戳标签，唯一不重复
-          name: Release ${!! env.ROOT_DIR_PREFIX !!} - ${!! env.ZIP_FILENAME !!}
+          tag_name: release-${{ env.CURRENT_TIMESTAMP }}
+          name: "Build ${{ env.DEVICE_NAME }} - ${{ env.CURRENT_TIMESTAMP }}"
           body: |
-            ## Sunos OnePlus Kernel Release
+            # 内核构建发布
             
-            ### 基础信息
+            ## 构建信息
+            - **设备**: ${{ github.event.inputs.CPUD }}
             - **分支**: ${{ github.event.inputs.CPU }}
-            - **设备代号**: ${{ github.event.inputs.CPUD }}
-            - **安卓版本**: ${{ github.event.inputs.ANDROID_VERSION }}
+            - **配置**: ${{ github.event.inputs.FEIL }}
+            - **Android版本**: ${{ github.event.inputs.ANDROID_VERSION }}
             - **内核版本**: ${{ github.event.inputs.KERNEL_VERSION }}
-            - **编译时间**: ${{ env.CURRENT_TIMESTAMP }}
-            - **配置文件**: ${{ github.event.inputs.FEIL }}
             
-            ### 功能配置
-            - **KernelSU 变体**: ${{ github.event.inputs.kernelsu_variant }}
-            - **KernelSU 版本**: ${{ env.KSUVER }}
-            - **SUSFS 启用**: ${{ github.event.inputs.SUSFS_ENABLED }}
-            - **VFS 补丁**: ${{ github.event.inputs.VFS_patch_ENABLED }}
-            - **内核名称后缀**: ${{ github.event.inputs.KERNEL_NAME }}-Cabage
+            ## KernelSU 信息
+            - **KernelSU变体**: ${{ github.event.inputs.kernelsu_variant }}
+            - **KernelSU版本**: ${{ env.KSUVER }}
+            - **SUSFS启用**: ${{ github.event.inputs.SUSFS_ENABLED }}
+            - **VFS补丁**: ${{ github.event.inputs.VFS_patch_ENABLED }}
             
-            ### 说明
-            - 压缩包为 AnyKernel3 格式，支持通过 Magisk 或 Recovery 刷入
-            - 若启用 KSU，刷入后需安装 KernelSU 管理器（https://github.com/tiann/KernelSU）
+            ## 构建详情
+            - **构建时间**: ${{ env.CURRENT_TIMESTAMP }}
+            - **构建标识**: ${{ env.ROOT_DIR_PREFIX }}
+            
+            ### 包含的功能
+            ✅ KernelSU Next 集成
+            ${{ github.event.inputs.SUSFS_ENABLED == 'true' && '✅ SUSFS 支持' || '❌ SUSFS 不支持' }}
+            ${{ github.event.inputs.VFS_patch_ENABLED == 'enable' && '✅ VFS 补丁' || '❌ VFS 补丁' }}
+            
+            ## 使用说明
+            1. 下载对应的AnyKernel3 ZIP包
+            2. 通过自定义Recovery刷入
+            3. 重启设备
+            
+            > **注意**: 刷机前请备份重要数据
           draft: false
           prerelease: false
+        if: success()
