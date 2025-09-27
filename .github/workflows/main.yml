@@ -96,28 +96,16 @@ jobs:
           rm -rf android/abi_gki_protected_exports_* || true
           sed -i 's/ -dirty//g' scripts/setlocalversion || true
 
-      - name: Set default KSU version
-        run: |
-          echo "KSUVER=00000" >> $GITHUB_ENV
-
-      - name: KernelSU & MKSU-SKN version
-        if: ${{ github.event.inputs.kernelsu_variant == 'Kernel' || github.event.inputs.kernelsu_variant == 'KSU_Next' }}
-        run: |
-          if [[ "${{ github.event.inputs.kernelsu_version }}" == "tag" ]]; then
-            echo "BRANCH=-" >> $GITHUB_ENV
-          elif [[ "${{ github.event.inputs.kernelsu_version }}" == "main" ]]; then
-            echo "BRANCH=-s susfs-dev" >> $GITHUB_ENV
-          fi
-
-      - name: Add KernelSU-Next
-        if: ${{ github.event.inputs.kernelsu_variant == 'KSU_Next' }}
+      - name: "⚡ Setup KernelSU Next | 配置 KernelSU Next"
         run: |
           cd kernel_workspace/kernel_platform
-          curl -LSs "https://raw.githubusercontent.com/rifsxd/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs-dev
-          cd ./KernelSU-Next
-          KSU_VERSION=$(expr $(git rev-list --count HEAD) "+" 10200)
+          echo "🛠️ 正在设置KernelSU Next..."
+          curl -LSs "https://raw.githubusercontent.com/pershoot/KernelSU-Next/next-susfs/kernel/setup.sh" | bash -s next-susfs
+          cd KernelSU-Next
+          KSU_VERSION=$(expr $(curl -sI "https://api.github.com/repos/KernelSU-Next/KernelSU-Next/commits?sha=next&per_page=1" | grep -i "link:" | sed -n 's/.*page=\([0-9]*\)>; rel="last".*/\1/p') "+" 10200)
           echo "KSUVER=$KSU_VERSION" >> $GITHUB_ENV
           sed -i "s/DKSU_VERSION=11998/DKSU_VERSION=${KSU_VERSION}/" kernel/Makefile
+          echo "✅ KernelSU Next 配置完成"
 
       - name: Apply SUSFS Patches MKSU-SKN
         if: ${{ (github.event.inputs.kernelsu_variant == 'KSU_Next') && github.event.inputs.SUSFS_ENABLED == 'true' }}
